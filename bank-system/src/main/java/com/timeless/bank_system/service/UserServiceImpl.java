@@ -1,20 +1,61 @@
 package com.timeless.bank_system.service;
 
+import com.timeless.bank_system.config.JwtTokenProvider;
 import com.timeless.bank_system.dto.*;
+import com.timeless.bank_system.entity.Role;
 import com.timeless.bank_system.entity.User;
 import com.timeless.bank_system.repository.UserRepository;
 import com.timeless.bank_system.utils.AccountUtils;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 
-@RequiredArgsConstructor
 @Service
+@RequiredArgsConstructor
 public class UserServiceImpl implements UserService {
 
     private final UserRepository userRepository;
     private final EmailService emailService;
+    private final PasswordEncoder encoder;
+    private final AuthenticationManager authenticationManager;
+    private final JwtTokenProvider jwtTokenProvider;
+
+    @Autowired
+    PasswordEncoder passwordEncoder;
+
+    @Autowired
+    TransactionService transactionService;
+
+
+    @Override
+    public BankResponse login(LoginDto loginDto) {
+
+        Authentication authentication = null;
+        authentication = authenticationManager.authenticate(
+                new UsernamePasswordAuthenticationToken(loginDto.getEmail(),loginDto.getPassword()));
+
+        EmailDetails loginAlert = EmailDetails
+                .builder()
+                .subject("YOU ARE LOGGED IN ")
+                .recipient(loginDto.getEmail())
+                .messageBody("You logged in in to your account")
+                .build();
+
+        emailService.sendEmailAlert(loginAlert);
+
+        return BankResponse.builder()
+                .responseCode("LOGIN SUCCESSFULLY")
+                .responseMessage(jwtTokenProvider.generateToken(loginDto.getEmail()))
+                .build();
+
+    }
 
     @Override
     public BankResponse createAccount(UserRequest userRequest) {
@@ -39,8 +80,10 @@ public class UserServiceImpl implements UserService {
                 .accountNumber(AccountUtils.generateAccountNumber())
                 .accountBalance(BigDecimal.ZERO)
                 .email(userRequest.getEmail())
+                .password(passwordEncoder.encode(userRequest.getPassword()))
                 .phoneNumber(userRequest.getPhoneNumber())
                 .alternativePhoneNumber(userRequest.getAlternativePhoneNumber())
+                .role(Role.valueOf("ROLE_USER"))
                 .status("ACTIVE")
                 .build();
 
@@ -128,6 +171,14 @@ public class UserServiceImpl implements UserService {
         userToCredit.setAccountBalance(userToCredit.getAccountBalance().add(creditDebitRequest.getAmount()));
         userRepository.save(userToCredit);
 
+        TransactionDto transactionDto = TransactionDto
+                .builder()
+                .accountNumber(userToCredit.getAccountNumber())
+                .transactionId("CREDIT")
+                .amount(creditDebitRequest.getAmount())
+                .build();
+        transactionService.saveTransaction(transactionDto);
+
         return BankResponse
                 .builder()
                 .responseCode(AccountUtils.ACCOUNT_CREDITED_SUCCESS)
@@ -154,9 +205,9 @@ public class UserServiceImpl implements UserService {
                     .build();
         }
 
-        User userToDebit = userRepository.findByAccountNumber(creditDebitRequest.getAccountNumber());
+        User sourceAccountUser = userRepository.findByAccountNumber(creditDebitRequest.getAccountNumber());
 
-        int availableBalance = userToDebit.getAccountBalance().intValue();
+        int availableBalance = sourceAccountUser.getAccountBalance().intValue();
         int amountToDept = creditDebitRequest.getAmount().intValue();
 
         if (availableBalance < amountToDept) {
@@ -167,10 +218,18 @@ public class UserServiceImpl implements UserService {
                     .accountInfo(null)
                     .build();
         }else {
-            userToDebit.setAccountBalance(userToDebit.getAccountBalance().subtract(creditDebitRequest.getAmount()));
-            userRepository.save(userToDebit);
+            sourceAccountUser.setAccountBalance(sourceAccountUser.getAccountBalance().subtract(creditDebitRequest.getAmount()));
+            userRepository.save(sourceAccountUser);
 
         }
+
+        TransactionDto transactionDto = TransactionDto
+                .builder()
+                .accountNumber(sourceAccountUser.getAccountNumber())
+                .transactionId("Debit")
+                .amount(creditDebitRequest.getAmount())
+                .build();
+        transactionService.saveTransaction(transactionDto);
 
         return BankResponse
                 .builder()
@@ -180,8 +239,8 @@ public class UserServiceImpl implements UserService {
                         AccountInfo
                                 .builder()
                                 .accountNumber(AccountUtils.generateAccountNumber())
-                                .accountName(userToDebit.getFirstName() + " " + userToDebit.getLastName() + " " + userToDebit.getOtherName())
-                                .accountBalance(userToDebit.getAccountBalance())
+                                .accountName(sourceAccountUser.getFirstName() + " " + sourceAccountUser.getLastName() + " " + sourceAccountUser.getOtherName())
+                                .accountBalance(sourceAccountUser.getAccountBalance())
                                 .build()
                 )
                 .build();
@@ -189,6 +248,7 @@ public class UserServiceImpl implements UserService {
     }
 
     @Override
+    @Transactional
     public BankResponse transfer(TransferRequest transferRequest) {
 
         boolean isSourceAccountExist = userRepository.existsByAccountNumber(transferRequest.getSourceAccount());
@@ -212,33 +272,50 @@ public class UserServiceImpl implements UserService {
         }
 
 
-        User userFromTransfer= userRepository.findByAccountNumber(transferRequest.getSourceAccount());
-        User userToTransfer = userRepository.findByAccountNumber(transferRequest.getDestinationAccount());
+        User sourceAccountUser = userRepository.findByAccountNumber(transferRequest.getSourceAccount());
+        String sourceAccountUserName = sourceAccountUser.getFirstName() + " " + sourceAccountUser.getLastName() + " " + sourceAccountUser.getOtherName();
 
-        userFromTransfer.setAccountBalance(userFromTransfer.getAccountBalance().subtract(BigDecimal.valueOf(transferRequest.getAmount())));
-        userRepository.save(userFromTransfer);
+        if (transferRequest.getAmount().compareTo(sourceAccountUser.getAccountBalance().doubleValue()) > 0) {
+            return BankResponse
+                    .builder()
+                    .responseCode(AccountUtils.INSUFFICIENT_BALANCE_CODE)
+                    .responseMessage(AccountUtils.INSUFFICIENT_BALANCE_MESSAGE)
+                    .accountInfo(null)
+                    .build();
+        }
 
-        EmailDetails emailDetails = EmailDetails
+        sourceAccountUser.setAccountBalance(sourceAccountUser.getAccountBalance().subtract(BigDecimal.valueOf(transferRequest.getAmount())));
+        userRepository.save(sourceAccountUser);
+
+        EmailDetails debtAlert = EmailDetails
                 .builder()
-                .subject("DEBT ALERT")
-                .recipient(userFromTransfer.getEmail())
-                .messageBody(transferRequest.getAmount() + " birr has been deducted from your account! your account balance is " + userFromTransfer.getAccountBalance())
+                .subject("DEPT ALERT")
+                .recipient(sourceAccountUser.getEmail())
+                .messageBody(transferRequest.getAmount() + " birr has been deducted from your account! your account balance is " + sourceAccountUser.getAccountBalance())
                 .build();
+        emailService.sendEmailAlert(debtAlert);
 
-        emailService.sendEmailAlert(emailDetails);
 
+        User destinationAccountUser = userRepository.findByAccountNumber(transferRequest.getDestinationAccount());
+        //String destinationAccountUserName = sourceAccountUser.getFirstName() + " " + sourceAccountUser.getLastName() + " " + sourceAccountUser.getOtherName();
+        destinationAccountUser.setAccountBalance(destinationAccountUser.getAccountBalance().add(BigDecimal.valueOf(transferRequest.getAmount())));
 
-        userToTransfer.setAccountBalance(userToTransfer.getAccountBalance().add(BigDecimal.valueOf(transferRequest.getAmount())));
-        userRepository.save(userToTransfer);
-
-        EmailDetails emailDetails1 = EmailDetails
+        userRepository.save(destinationAccountUser);
+        EmailDetails creditAlert = EmailDetails
                 .builder()
                 .subject("CREDIT ALERT")
-                .recipient(userToTransfer.getEmail())
-                .messageBody(transferRequest.getAmount() + " birr has been credited to your account! your account balance is " + userToTransfer.getAccountBalance())
+                .recipient(sourceAccountUser.getEmail())
+                .messageBody(transferRequest.getAmount() + " birr has been sent to your account! from " + sourceAccountUserName + " your account balance is " + destinationAccountUser.getAccountBalance())
                 .build();
+        emailService.sendEmailAlert(creditAlert);
 
-        emailService.sendEmailAlert(emailDetails1);
+        TransactionDto transactionDto = TransactionDto
+                .builder()
+                .accountNumber(destinationAccountUser.getAccountNumber())
+                .transactionType("CREDIT")
+                .amount(BigDecimal.valueOf(transferRequest.getAmount()))
+                .build();
+        transactionService.saveTransaction(transactionDto);
 
 
         return BankResponse
@@ -248,5 +325,6 @@ public class UserServiceImpl implements UserService {
                 .accountInfo(null)
                 .build();
     }
+
 
 }

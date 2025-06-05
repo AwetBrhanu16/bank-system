@@ -5,8 +5,6 @@ import com.timeless.bank_system.service.UserService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
-import java.net.CacheRequest;
-
 @RestController
 @RequestMapping("/api/user")
 public class UserController {
@@ -17,6 +15,11 @@ public class UserController {
     @PostMapping
     public BankResponse createAccount(@RequestBody UserRequest userRequest){
         return userService.createAccount(userRequest);
+    }
+
+    @PostMapping("/login")
+    public BankResponse login(@RequestBody LoginDto loginDto){
+        return userService.login(loginDto);
     }
 
     @GetMapping("/balanceEnquiry")
